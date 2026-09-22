@@ -41,3 +41,11 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Binary installers / large files
+*.msi
+*.exe
+*.dmg
+*.pkg
+*.deb
+*.rpm
