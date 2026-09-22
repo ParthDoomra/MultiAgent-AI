@@ -1,0 +1,9 @@
+{
+  "name": "multiagent-root",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix Business-Launch-Analyst/artifacts/business-launch-analyst run dev",
+    "build": "npm --prefix Business-Launch-Analyst/artifacts/business-launch-analyst run build"
+  }
+}
