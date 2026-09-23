@@ -56,7 +56,7 @@ async def extract_parameters_with_external_llm(query: str) -> Optional[Dict[str,
         "- cost (number or null): unit manufacturing or procurement cost\n"
         "- price (number or null): target selling price per unit\n"
         "- expected_units (integer or null): projected sales volume\n"
-        "- currency (string): currency symbol (e.g. $, ₹, £, €)\n"
+        "- currency (string): currency symbol (e.g. $, ₹, £, €). If pricing or currency is explicitly given in the query, use that exact currency only. If currency or price is not specified, you MUST default strictly to '₹' (Indian Rupee / INR).\n"
         "- is_negotiation (boolean): true if query involves deals, discounts, wholesale, commercial terms\n\n"
         "Return ONLY the raw JSON object, no markdown, no explanation."
     )
@@ -138,30 +138,34 @@ def extract_parameters_regex(query: str) -> Dict[str, Any]:
     
     extracted: Dict[str, Any] = {
         "product": "",
-        "target_market": "Global",
+        "target_market": "India",
         "cost": None,
         "price": None,
         "expected_units": 500,
-        "currency": "$",
+        "currency": "₹",
         "is_negotiation": False
     }
 
-    # 1. Detect currency
-    if "₹" in query or "inr" in q or "rupee" in q or "rs." in q or "rs " in q:
-        extracted["currency"] = "₹"
-        extracted["target_market"] = "India"
+    # 1. Detect explicit currency
+    if "$" in query or "usd" in q or "dollar" in q:
+        extracted["currency"] = "$"
+        extracted["target_market"] = "US"
     elif "£" in query or "gbp" in q or "pound" in q:
         extracted["currency"] = "£"
         extracted["target_market"] = "UK"
     elif "€" in query or "eur" in q or "euro" in q:
         extracted["currency"] = "€"
         extracted["target_market"] = "Europe"
-    elif "aed" in q or "dirham" in q or "dubai" in q or "uae" in q:
-        extracted["currency"] = "$"
+    elif "aed" in q or "dirham" in q:
+        extracted["currency"] = "AED"
         extracted["target_market"] = "Dubai"
-    elif "$" in query or "usd" in q or "dollar" in q:
-        extracted["currency"] = "$"
-        extracted["target_market"] = "US"
+    elif "₹" in query or "inr" in q or "rupee" in q or "rs." in q or "rs " in q:
+        extracted["currency"] = "₹"
+        extracted["target_market"] = "India"
+    else:
+        # Standard default currency: Indian Rupee (₹)
+        extracted["currency"] = "₹"
+        extracted["target_market"] = "India"
 
     # 2. Detect explicit target market mentions
     market_map = {
@@ -233,14 +237,14 @@ def extract_parameters_regex(query: str) -> Dict[str, Any]:
 
     # 6. Extract Price
     price_m = re.search(
-        r'(?:priced\s*(?:at|of|is)?|selling\s+price\s*(?:of|is|at|:)?|selling\s+for|price\s*(?:of|is|at|:)?|sell\s+(?:at|for)\s*|at\s*[\$₹£€])\s*[\$₹£€Rs\.\s]*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)',
+        r'(?:priced\s*(?:at|of|is)?|selling\s+price\s*(?:of|is|at|:)?|selling\s+for|price\s*(?:of|is|at|:)?|sell\s+(?:at|for)\s*|at\s*[\$₹£€Rs\.]+|for\s+[\$₹£€Rs\.]+|at\s+|for\s+)\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)\s*(?:per|\/|each|\b)',
         q
     )
     if price_m:
         extracted["price"] = float(price_m.group(1).replace(",", ""))
 
     # 7. Fallback currency number matching if price/cost still unresolved
-    all_currencies = re.findall(r'[\$₹£€]\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)', query)
+    all_currencies = re.findall(r'(?:[\$₹£€]|(?:rs\.?|inr|usd|gbp|eur|aed)\s*)\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)', query, re.IGNORECASE)
     if all_currencies:
         nums = [float(n.replace(",", "")) for n in all_currencies]
         if extracted["cost"] is None and extracted["price"] is None:
@@ -260,8 +264,21 @@ def extract_parameters_regex(query: str) -> Dict[str, Any]:
 
     # Defaults for financial stability if user didn't specify numbers
     if extracted["cost"] is None and extracted["price"] is None:
-        extracted["cost"] = 25.0 if extracted["currency"] == "$" else 1500.0
-        extracted["price"] = 60.0 if extracted["currency"] == "$" else 2999.0
+        if extracted["currency"] == "$":
+            extracted["cost"] = 25.0
+            extracted["price"] = 60.0
+        elif extracted["currency"] == "£":
+            extracted["cost"] = 20.0
+            extracted["price"] = 50.0
+        elif extracted["currency"] == "€":
+            extracted["cost"] = 22.0
+            extracted["price"] = 55.0
+        elif extracted["currency"] == "AED":
+            extracted["cost"] = 90.0
+            extracted["price"] = 220.0
+        else: # Indian Rupee ₹ / standard default
+            extracted["cost"] = 1500.0
+            extracted["price"] = 2999.0
     elif extracted["cost"] is None and extracted["price"] is not None:
         extracted["cost"] = round(extracted["price"] * 0.4, 2)
     elif extracted["price"] is None and extracted["cost"] is not None:
@@ -294,21 +311,27 @@ async def parse_query_and_extract(query: str) -> Tuple[Dict[str, Any], list]:
         if not extracted.get("product") or extracted.get("product") in ("None", "null"):
             extracted["product"] = regex_extracted.get("product", "New Venture")
         if not extracted.get("target_market") or extracted.get("target_market") in ("None", "null"):
-            extracted["target_market"] = regex_extracted.get("target_market", "Global")
+            extracted["target_market"] = regex_extracted.get("target_market", "India")
+        # If no explicit foreign currency was provided in query, standard currency is strictly Indian Rupee (₹)
+        has_explicit_foreign_currency = any(
+            sym in query.lower() for sym in ["$", "usd", "dollar", "£", "gbp", "pound", "€", "eur", "euro", "aed", "dirham"]
+        )
+        if not has_explicit_foreign_currency:
+            extracted["currency"] = "₹"
+        elif not extracted.get("currency") or extracted.get("currency") == "₹":
+            extracted["currency"] = regex_extracted.get("currency", "$")
         if extracted.get("cost") is None:
-            extracted["cost"] = regex_extracted.get("cost", 25.0)
+            extracted["cost"] = regex_extracted.get("cost", 1500.0 if extracted.get("currency") == "₹" else 25.0)
         else:
             extracted["cost"] = float(extracted["cost"])
         if extracted.get("price") is None:
-            extracted["price"] = regex_extracted.get("price", 60.0)
+            extracted["price"] = regex_extracted.get("price", 2999.0 if extracted.get("currency") == "₹" else 60.0)
         else:
             extracted["price"] = float(extracted["price"])
         if not extracted.get("expected_units"):
             extracted["expected_units"] = regex_extracted.get("expected_units", 500)
         else:
             extracted["expected_units"] = int(extracted["expected_units"])
-        if not extracted.get("currency"):
-            extracted["currency"] = regex_extracted.get("currency", "$")
 
     logger.info(
         f"Final Extracted Query Parameters: Product='{extracted.get('product')}', "
@@ -316,19 +339,8 @@ async def parse_query_and_extract(query: str) -> Tuple[Dict[str, Any], list]:
         f"Cost={extracted.get('cost')}, Units={extracted.get('expected_units')}, Currency={extracted.get('currency')}"
     )
 
-    # Step 2: Determine relevance
-    needed_agents = ["finance", "market"]
-
-    # Sales agent if negotiation, deal, or pricing strategy keywords are present
-    sales_keywords = [
-        "negotiat", "discount", "deal", "retailer", "distributor", "wholesale",
-        "bulk", "b2b", "consignment", "margin split", "pricing strategy",
-        "lowest price", "floor price", "asking price", "opening offer",
-        "commercial terms", "concession", "sales pitch", "partnership"
-    ]
-    query_lower = query.lower()
-    if extracted.get("is_negotiation") or any(k in query_lower for k in sales_keywords):
-        needed_agents.append("sales")
+    # Step 2: Determine relevance - all three core agents are always active
+    needed_agents = ["finance", "market", "sales"]
 
     return extracted, needed_agents
 
@@ -440,13 +452,14 @@ async def orchestrate_request(
             market=agents_output.get("market", {}),
             sales=agents_output.get("sales"),
             report=report_output,
-            currency=params.get("currency", "$")
+            currency=params.get("currency", "₹")
         )
 
     session_id = request.session_id or str(uuid.uuid4())
     return OrchestrateResponse(
         type="result",
         session_id=session_id,
+        currency=params.get("currency", "₹"),
         message=followup_answer,
         agents=agents_output,
         report=ReportResponse(**report_output),
@@ -463,7 +476,7 @@ async def generate_followup_answer(
     market: dict,
     report: dict,
     sales: Optional[dict] = None,
-    currency: str = "$"
+    currency: str = "₹"
 ) -> str:
     """
     Generate an intelligent, researched answer to a follow-up query using Azure AI Foundry Chat Agent,
@@ -562,7 +575,7 @@ async def generate_followup_answer(
     margin = finance.get("margin_percent", 0.0)
     price = finance.get("price", 0.0)
     cost = finance.get("cost", 0.0)
-    curr = currency or "$"
+    curr = currency or "₹"
     main_risk = report.get("main_risk", market.get("risks", ["Market competition"])[0] if market.get("risks") else "Competitive pressure")
 
     if "lower" in q_lower or "discount" in q_lower or "20%" in q_lower or "drop" in q_lower or "cut" in q_lower:

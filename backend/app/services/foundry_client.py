@@ -37,7 +37,7 @@ Analyze the user's business query or conversation and extract the following para
 - cost (number or null): The unit manufacturing, procurement, or direct variable cost per item or subscriber. Must be a numeric float without currency symbols (e.g. '$25/bottle' -> 25.0, 'manufacturing cost is ₹1,500' -> 1500.0, 'cost of 10' -> 10.0).
 - price (number or null): The target selling price, retail price, or subscription fee per item or subscriber. Must be a numeric float without currency symbols (e.g. '$120/bottle' -> 120.0, 'priced at ₹2,999' -> 2999.0, 'sell for $50' -> 50.0).
 - expected_units (integer or null): The projected sales volume, target customers, or units sold per month/batch (e.g. '300 bottles a month' -> 300, '500 units' -> 500, '1,000 subscribers' -> 1000).
-- currency (string): The currency symbol or code used in the query (e.g. '$', '₹', '€', '£', 'AED', 'USD', 'INR'). If unspecified, infer from country or default to '$'.
+- currency (string): The currency symbol or code used in the query (e.g. '₹', '$', '€', '£', 'AED', 'USD', 'INR'). If the pricing or currency is explicitly given in the query (such as '$100', '£50', '€20', '₹1500', 'Rs 500', '50 USD'), extract that exact currency symbol. If currency or price is not specified, you MUST strictly default to '₹' (Indian Rupee / INR).
 - is_negotiation (boolean): Set to true if the query asks about wholesale deals, vendor discounts, commercial negotiations, retailer margins, or opening offers.
 
 You MUST respond ONLY with a strict JSON object (no markdown code blocks, no backticks, no conversational text) matching this schema:

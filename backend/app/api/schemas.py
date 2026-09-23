@@ -146,6 +146,9 @@ class OrchestrateResponse(BaseModel):
         ..., description="'clarification' if more info is needed, 'result' if the full report is ready"
     )
     session_id: str = Field(..., description="Session ID — echo back in the next request's history")
+    currency: Optional[str] = Field(
+        default="₹", description="Currency symbol used for this analysis (e.g. ₹, $, £, €)"
+    )
     message: Optional[str] = Field(
         default=None,
         description="The clarifying question to show the user (only present when type='clarification')"
