@@ -21,23 +21,43 @@ from app.services.finance_service import calculate_finance
 from app.services.market_service import analyze_market
 from app.services.sales_service import analyze_sales
 from app.services.report_service import generate_business_report
+from app.services.foundry_client import (
+    run_extractor_agent_thread,
+    run_followup_agent_thread,
+)
 
 logger = logging.getLogger(__name__)
 
 
-async def extract_parameters_with_llm(query: str) -> Optional[Dict[str, Any]]:
+def extract_parameters_with_foundry(query: str) -> Optional[Dict[str, Any]]:
     """
-    Attempt to extract parameters using an LLM API if keys are configured.
-    Supports OpenAI, Groq, and Google Gemini.
+    Extract business parameters using the Azure AI Foundry Extractor Agent powered by the GPT model.
+    """
+    try:
+        logger.info(f"Extracting parameters via Foundry Extractor Agent for query: '{query[:80]}...'")
+        result = run_extractor_agent_thread(query)
+        if result and isinstance(result, dict) and result.get("product"):
+            logger.info(f"Foundry Extractor Agent successfully extracted: {result}")
+            return result
+    except Exception as e:
+        logger.warning(f"Foundry Extractor Agent extraction failed: {e}")
+    return None
+
+
+async def extract_parameters_with_external_llm(query: str) -> Optional[Dict[str, Any]]:
+    """
+    Fallback extraction using direct OpenAI/Groq/Gemini if API keys are configured.
     """
     system_prompt = (
         "You are an entity extraction system for a business assistant. "
         "Extract the following fields from the user's business query as a strict JSON object:\n"
-        "- product (string): name of product\n"
-        "- target_market (string): geographic or demographic market (e.g. India, US)\n"
+        "- product (string): exact name or description of product/service\n"
+        "- target_market (string): geographic or demographic market (e.g. Dubai, US, India, UK)\n"
         "- cost (number or null): unit manufacturing or procurement cost\n"
         "- price (number or null): target selling price per unit\n"
-        "- expected_units (integer or null): projected sales volume\n\n"
+        "- expected_units (integer or null): projected sales volume\n"
+        "- currency (string): currency symbol (e.g. $, ₹, £, €)\n"
+        "- is_negotiation (boolean): true if query involves deals, discounts, wholesale, commercial terms\n\n"
         "Return ONLY the raw JSON object, no markdown, no explanation."
     )
 
@@ -111,98 +131,141 @@ async def extract_parameters_with_llm(query: str) -> Optional[Dict[str, Any]]:
 
 def extract_parameters_regex(query: str) -> Dict[str, Any]:
     """
-    Deterministic rule-based and regex parameter extraction fallback.
-    Accurately extracts product, target_market, cost, price, and expected_units.
+    Dynamic rule-based and regex parameter extraction fallback.
+    Accurately extracts product, target_market, cost, price, expected_units, and currency.
     """
     q = query.lower()
     
     extracted: Dict[str, Any] = {
-        "product": "smartwatch",
-        "target_market": "India",
+        "product": "",
+        "target_market": "Global",
         "cost": None,
         "price": None,
-        "expected_units": 1000
+        "expected_units": 500,
+        "currency": "$",
+        "is_negotiation": False
     }
 
-    # Detect product
-    known_products = [
-        "smartwatch", "smart watch", "fitness tracker", "fitness band",
-        "earbuds", "tws earbuds", "headphones", "phone", "smartphone",
-        "laptop", "tablet", "meal-planning service", "meal planning"
-    ]
-    for p in known_products:
-        if p in q:
-            extracted["product"] = p
-            break
-    else:
-        # Pattern match: "launch a [product] at/in/with"
-        prod_m = re.search(r'(?:launch|start|sell)\s+(?:a|an)?\s*([a-zA-Z\s]{3,30}?)(?:\s+at|\s+priced|\s+in|\s+with|\s+for|\$|₹)', q)
-        if prod_m:
-            extracted["product"] = prod_m.group(1).strip()
-
-    # Detect target market
-    if "₹" in query or "inr" in q or "rupee" in q or "india" in q:
+    # 1. Detect currency
+    if "₹" in query or "inr" in q or "rupee" in q or "rs." in q or "rs " in q:
+        extracted["currency"] = "₹"
         extracted["target_market"] = "India"
-    elif "$" in query or "usd" in q or "us" in q or "usa" in q:
-        extracted["target_market"] = "US"
-    elif "uk" in q or "london" in q:
+    elif "£" in query or "gbp" in q or "pound" in q:
+        extracted["currency"] = "£"
         extracted["target_market"] = "UK"
+    elif "€" in query or "eur" in q or "euro" in q:
+        extracted["currency"] = "€"
+        extracted["target_market"] = "Europe"
+    elif "aed" in q or "dirham" in q or "dubai" in q or "uae" in q:
+        extracted["currency"] = "$"
+        extracted["target_market"] = "Dubai"
+    elif "$" in query or "usd" in q or "dollar" in q:
+        extracted["currency"] = "$"
+        extracted["target_market"] = "US"
 
-    # Specific country name overrides
-    for m in ["india", "us", "usa", "europe", "germany", "japan", "uk"]:
-        if re.search(r'\b' + m + r'\b', q):
-            extracted["target_market"] = m.capitalize() if m not in ("us", "usa", "uk") else m.upper()
+    # 2. Detect explicit target market mentions
+    market_map = {
+        "dubai": "Dubai",
+        "uae": "UAE",
+        "india": "India",
+        "us": "US",
+        "usa": "US",
+        "united states": "United States",
+        "uk": "UK",
+        "london": "London",
+        "portland": "Portland",
+        "seattle": "Seattle",
+        "germany": "Germany",
+        "europe": "Europe",
+        "canada": "Canada",
+        "australia": "Australia",
+        "singapore": "Singapore",
+        "japan": "Japan"
+    }
+    for key, val in market_map.items():
+        if re.search(r'\b' + re.escape(key) + r'\b', q):
+            extracted["target_market"] = val
             break
 
-    # 1. Extract expected units first (e.g. "500 units a month", "sell 500 units")
-    units_m = re.search(r'([0-9]+(?:,[0-9]+)*)\s*(?:units|pcs|pieces|items)\b', q)
+    # 3. Dynamic Product Extraction
+    # Remove leading action prefixes
+    clean_q = re.sub(
+        r'^(?:should i|can i|i want to|planning to|how about|what if i|is it profitable to)?\s*(?:launch|start|sell|create|build|open|introduce|run)\s+(?:a|an|the)?\s*',
+        '',
+        query,
+        flags=re.IGNORECASE
+    ).strip()
+
+    # Match product before prepositions like "in [market]", "at [price]", "priced at", "for [price]", "with [cost]"
+    prod_match = re.search(
+        r'^([a-zA-Z0-9\s\-]+?)(?:\s+(?:in|at|for|priced at|with|targeting|costing|selling)\s+[\$₹£€0-9a-zA-Z]|\s*[\$₹£€]|\?|$)',
+        clean_q,
+        flags=re.IGNORECASE
+    )
+    if prod_match:
+        cand = prod_match.group(1).strip()
+        # Filter out filler words
+        if cand.lower() not in ("business", "service", "company", "idea", "product", "it") and len(cand) >= 3:
+            extracted["product"] = cand
+
+    if not extracted["product"]:
+        # Fallback keyword checks
+        for p in ["smartwatch", "fitness tracker", "perfume", "coffee", "earbuds", "meal-planning service", "saas", "clothing", "skincare"]:
+            if p in q:
+                extracted["product"] = p
+                break
+
+    if not extracted["product"]:
+        extracted["product"] = "New Business Venture"
+
+    # 4. Extract expected units
+    units_m = re.search(r'([0-9]+(?:,[0-9]+)*)\s*(?:units|pcs|pieces|items|bottles|subscribers|customers|clients|orders|sales|users|boxes)\b', q)
     if units_m:
         extracted["expected_units"] = int(units_m.group(1).replace(",", ""))
 
-    # 2. Extract Cost (e.g. "manufacturing cost is ₹1,500", "cost is 1500", "cost of ₹1,500")
-    cost_m = re.search(r'(?:manufacturing\s+cost|unit\s+cost|procurement\s+cost|cost)\s*(?:of|is|at|:)?\s*[₹$Rs\.\s]*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)', q)
+    # 5. Extract Cost
+    cost_m = re.search(
+        r'(?:manufacturing\s+cost|procurement\s+cost|unit\s+cost|cost\s+of|cost\s+is|cost\s*:|cost)\s*(?:of|is|at|:)?\s*[\$₹£€Rs\.\s]*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)',
+        q
+    )
     if cost_m:
         extracted["cost"] = float(cost_m.group(1).replace(",", ""))
 
-    # 3. Extract Price
-    # Matches: "at ₹2,999", "priced at ₹2,999", "selling price of ₹2,999", "sell at ₹2,999", "price is 2999"
-    price_m = re.search(r'(?:priced\s*(?:at|of|is)?|selling\s+price\s*(?:of|is|at|:)?|price\s*(?:of|is|at|:)?|sell\s+(?:at|for)\s*|launch\s+(?:a|an)?\s*[\w\s]{2,25}?\s+at\s+)\s*[₹$Rs\.\s]*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)', q)
+    # 6. Extract Price
+    price_m = re.search(
+        r'(?:priced\s*(?:at|of|is)?|selling\s+price\s*(?:of|is|at|:)?|selling\s+for|price\s*(?:of|is|at|:)?|sell\s+(?:at|for)\s*|at\s*[\$₹£€])\s*[\$₹£€Rs\.\s]*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)',
+        q
+    )
     if price_m:
         extracted["price"] = float(price_m.group(1).replace(",", ""))
-    else:
-        # Check for standalone "at ₹2,999"
-        at_m = re.search(r'\bat\s+[₹$Rs\.\s]*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)', q)
-        if at_m:
-            extracted["price"] = float(at_m.group(1).replace(",", ""))
 
-    # 4. Fallback if currency symbols are present
-    # Look for all currency-tagged numbers: ₹1,500 or $2,999
-    curr_numbers = re.findall(r'[₹$Rs]\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)', query)
-    if curr_numbers:
-        parsed_curr = [float(c.replace(",", "")) for c in curr_numbers]
-        # If cost is known, price is the other currency value
-        if extracted["cost"] is not None and extracted["price"] is None:
-            remaining = [p for p in parsed_curr if p != extracted["cost"]]
-            if remaining:
-                extracted["price"] = remaining[0]
-        # If price is known, cost is the other currency value
+    # 7. Fallback currency number matching if price/cost still unresolved
+    all_currencies = re.findall(r'[\$₹£€]\s*([0-9]+(?:,[0-9]+)*(?:\.[0-9]+)?)', query)
+    if all_currencies:
+        nums = [float(n.replace(",", "")) for n in all_currencies]
+        if extracted["cost"] is None and extracted["price"] is None:
+            if len(nums) >= 2:
+                extracted["cost"] = min(nums)
+                extracted["price"] = max(nums)
+            elif len(nums) == 1:
+                extracted["price"] = nums[0]
         elif extracted["price"] is not None and extracted["cost"] is None:
-            remaining = [p for p in parsed_curr if p != extracted["price"]]
+            remaining = [n for n in nums if n != extracted["price"]]
             if remaining:
                 extracted["cost"] = remaining[0]
-        # If neither is resolved but 2 currency values exist
-        elif extracted["cost"] is None and extracted["price"] is None and len(parsed_curr) >= 2:
-            extracted["cost"] = min(parsed_curr)
-            extracted["price"] = max(parsed_curr)
-        elif extracted["price"] is None and len(parsed_curr) == 1:
-            extracted["price"] = parsed_curr[0]
+        elif extracted["cost"] is not None and extracted["price"] is None:
+            remaining = [n for n in nums if n != extracted["cost"]]
+            if remaining:
+                extracted["price"] = remaining[0]
 
-
-    # Default safeguards
-    if extracted["cost"] is None:
-        extracted["cost"] = 1500.0
-    if extracted["price"] is None:
-        extracted["price"] = 2999.0
+    # Defaults for financial stability if user didn't specify numbers
+    if extracted["cost"] is None and extracted["price"] is None:
+        extracted["cost"] = 25.0 if extracted["currency"] == "$" else 1500.0
+        extracted["price"] = 60.0 if extracted["currency"] == "$" else 2999.0
+    elif extracted["cost"] is None and extracted["price"] is not None:
+        extracted["cost"] = round(extracted["price"] * 0.4, 2)
+    elif extracted["price"] is None and extracted["cost"] is not None:
+        extracted["price"] = round(extracted["cost"] * 2.2, 2)
 
     return extracted
 
@@ -210,45 +273,51 @@ def extract_parameters_regex(query: str) -> Dict[str, Any]:
 async def parse_query_and_extract(query: str) -> Tuple[Dict[str, Any], list]:
     """
     Step 1 & Step 2:
-    1. Use an LLM call to extract cost, price, expected_units, product, and target_market.
-    2. Determine which agents are relevant:
-       - finance always if pricing info is present
-       - market if a product/market is mentioned
+    1. First use Azure AI Foundry Extractor Agent (or external LLM) to accurately extract product, market, cost, price.
+    2. Fallback to smart regex extraction.
+    3. Determine which agents are relevant (finance, market, sales).
     """
-    extracted = await extract_parameters_with_llm(query)
+    # 1. Try Foundry Extractor Agent (powered by configured GPT model)
+    extracted = extract_parameters_with_foundry(query)
+
+    # 2. If not found, try external LLMs if configured
     if not extracted or not extracted.get("product"):
-        extracted = extract_parameters_regex(query)
+        extracted = await extract_parameters_with_external_llm(query)
+
+    # 3. Always run regex extraction as baseline / fallback
+    regex_extracted = extract_parameters_regex(query)
+
+    if not extracted:
+        extracted = regex_extracted
     else:
-        # Ensure fallback defaults for any missing critical values
+        # Merge to ensure complete fields
+        if not extracted.get("product") or extracted.get("product") in ("None", "null"):
+            extracted["product"] = regex_extracted.get("product", "New Venture")
+        if not extracted.get("target_market") or extracted.get("target_market") in ("None", "null"):
+            extracted["target_market"] = regex_extracted.get("target_market", "Global")
         if extracted.get("cost") is None:
-            extracted["cost"] = 1500.0
+            extracted["cost"] = regex_extracted.get("cost", 25.0)
         else:
             extracted["cost"] = float(extracted["cost"])
-
         if extracted.get("price") is None:
-            extracted["price"] = 2999.0
+            extracted["price"] = regex_extracted.get("price", 60.0)
         else:
             extracted["price"] = float(extracted["price"])
-
         if not extracted.get("expected_units"):
-            extracted["expected_units"] = 500
+            extracted["expected_units"] = regex_extracted.get("expected_units", 500)
         else:
             extracted["expected_units"] = int(extracted["expected_units"])
+        if not extracted.get("currency"):
+            extracted["currency"] = regex_extracted.get("currency", "$")
 
-        if not extracted.get("product"):
-            extracted["product"] = "smartwatch"
-        if not extracted.get("target_market"):
-            extracted["target_market"] = "India"
+    logger.info(
+        f"Final Extracted Query Parameters: Product='{extracted.get('product')}', "
+        f"Market='{extracted.get('target_market')}', Price={extracted.get('price')}, "
+        f"Cost={extracted.get('cost')}, Units={extracted.get('expected_units')}, Currency={extracted.get('currency')}"
+    )
 
     # Step 2: Determine relevance
-    needed_agents = []
-    # Finance agent if cost, price, or pricing terminology is present
-    if extracted.get("cost") is not None or extracted.get("price") is not None:
-        needed_agents.append("finance")
-
-    # Market agent if product or target_market is present
-    if extracted.get("product") or extracted.get("target_market"):
-        needed_agents.append("market")
+    needed_agents = ["finance", "market"]
 
     # Sales agent if negotiation, deal, or pricing strategy keywords are present
     sales_keywords = [
@@ -258,12 +327,8 @@ async def parse_query_and_extract(query: str) -> Tuple[Dict[str, Any], list]:
         "commercial terms", "concession", "sales pitch", "partnership"
     ]
     query_lower = query.lower()
-    if any(k in query_lower for k in sales_keywords):
+    if extracted.get("is_negotiation") or any(k in query_lower for k in sales_keywords):
         needed_agents.append("sales")
-
-    # Always ensure at least these two for comprehensive business decision
-    if not needed_agents:
-        needed_agents = ["finance", "market"]
 
     return extracted, needed_agents
 
@@ -274,10 +339,10 @@ async def orchestrate_request(
 ) -> OrchestrateResponse:
     """
     Orchestrator Agent workflow:
-    1. Extract cost, price, expected_units, product, target_market from query.
+    1. Extract cost, price, expected_units, product, target_market from query using Foundry Extractor Agent.
     2. Determine relevant agents (finance, market, sales).
-    3. Call relevant agents.
-    4. Call report agent with combined outputs (incorporating sales if present).
+    3. Call relevant Foundry agents.
+    4. Call Foundry report agent with combined outputs (incorporating sales if present).
     5. Return: { agents: { finance: {...}, market: {...}, sales: {...} }, report: {...}, sales: {...} }
     """
     full_context = request.query
@@ -305,18 +370,17 @@ async def orchestrate_request(
                 "revenue": params["price"] * params["expected_units"],
                 "cost_total": params["cost"] * params["expected_units"],
                 "gross_profit": (params["price"] - params["cost"]) * params["expected_units"],
-                "margin_percent": round(((params["price"] - params["cost"]) / params["price"]) * 100, 2),
+                "margin_percent": round(((params["price"] - params["cost"]) / params["price"]) * 100, 2) if params["price"] > 0 else 0.0,
                 "cost": params["cost"],
                 "price": params["price"],
                 "expected_units": params["expected_units"]
             }
     else:
-        # Provide sensible baseline
         agents_output["finance"] = {
             "revenue": params["price"] * params["expected_units"],
             "cost_total": params["cost"] * params["expected_units"],
             "gross_profit": (params["price"] - params["cost"]) * params["expected_units"],
-            "margin_percent": round(((params["price"] - params["cost"]) / params["price"]) * 100, 2),
+            "margin_percent": round(((params["price"] - params["cost"]) / params["price"]) * 100, 2) if params["price"] > 0 else 0.0,
             "cost": params["cost"],
             "price": params["price"],
             "expected_units": params["expected_units"]
@@ -334,16 +398,16 @@ async def orchestrate_request(
         except Exception as e:
             logger.warning(f"Direct market analysis failed: {e}")
             agents_output["market"] = {
-                "market_size": f"General consumer market in {params['target_market']}",
+                "market_size": f"General consumer market for {params['product']} in {params['target_market']}",
                 "competitors": [],
-                "opportunities": ["Standard expansion opportunities"],
+                "opportunities": ["Standard market expansion opportunities"],
                 "risks": ["Competitive pricing pressures"]
             }
     else:
         agents_output["market"] = {
-            "market_size": f"General consumer market in {params['target_market']}",
+            "market_size": f"General consumer market for {params['product']} in {params['target_market']}",
             "competitors": [],
-            "opportunities": ["Standard expansion opportunities"],
+            "opportunities": ["Standard market expansion opportunities"],
             "risks": ["Competitive pricing pressures"]
         }
 
@@ -375,7 +439,8 @@ async def orchestrate_request(
             finance=agents_output.get("finance", {}),
             market=agents_output.get("market", {}),
             sales=agents_output.get("sales"),
-            report=report_output
+            report=report_output,
+            currency=params.get("currency", "$")
         )
 
     session_id = request.session_id or str(uuid.uuid4())
@@ -397,13 +462,31 @@ async def generate_followup_answer(
     finance: dict,
     market: dict,
     report: dict,
-    sales: Optional[dict] = None
+    sales: Optional[dict] = None,
+    currency: str = "$"
 ) -> str:
     """
-    Generate an intelligent, researched answer to a follow-up query using LLM if available,
-    or deterministic domain knowledge synthesis based on financial, market, and sales findings.
+    Generate an intelligent, researched answer to a follow-up query using Azure AI Foundry Chat Agent,
+    external LLMs, or dynamic domain knowledge synthesis based on financial, market, and sales findings.
     """
-    history_str = "\n".join([f"{t.role}: {t.content}" for t in history])
+    # 1. Try Azure AI Foundry Chat Agent (powered by configured GPT model)
+    try:
+        logger.info(f"Generating follow-up answer via Foundry Chat Agent for query: '{query[:80]}...'")
+        foundry_chat_response = run_followup_agent_thread(
+            query=query,
+            history=history,
+            finance_data=finance,
+            market_data=market,
+            report_data=report,
+            sales_data=sales
+        )
+        if foundry_chat_response and len(foundry_chat_response.strip()) > 20:
+            logger.info("Successfully generated follow-up answer via Foundry Chat Agent")
+            return foundry_chat_response.strip()
+    except Exception as e:
+        logger.warning(f"Foundry Chat Agent follow-up failed: {e}")
+
+    history_str = "\n".join([f"{t.role if hasattr(t, 'role') else t.get('role')}: {t.content if hasattr(t, 'content') else t.get('content')}" for t in history])
     sales_info = ""
     if sales:
         sales_info = (
@@ -425,7 +508,7 @@ async def generate_followup_answer(
         f"Provide a direct, concise, and insightful answer (2-3 paragraphs or clear bullet points) that directly answers the user's question with specific numbers, competitive tradeoffs, and strategic advice. Do not output generic boilerplate."
     )
 
-    # 1. Try OpenAI
+    # 2. Try OpenAI
     if settings.OPENAI_API_KEY:
         try:
             headers = {"Authorization": f"Bearer {settings.OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -444,7 +527,7 @@ async def generate_followup_answer(
         except Exception as e:
             logger.warning(f"OpenAI follow-up synthesis failed: {e}")
 
-    # 2. Try Groq
+    # 3. Try Groq
     if settings.GROQ_API_KEY:
         try:
             headers = {"Authorization": f"Bearer {settings.GROQ_API_KEY}", "Content-Type": "application/json"}
@@ -463,7 +546,7 @@ async def generate_followup_answer(
         except Exception as e:
             logger.warning(f"Groq follow-up synthesis failed: {e}")
 
-    # 3. Try Gemini
+    # 4. Try Gemini
     if settings.GEMINI_API_KEY:
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={settings.GEMINI_API_KEY}"
@@ -479,39 +562,41 @@ async def generate_followup_answer(
     margin = finance.get("margin_percent", 0.0)
     price = finance.get("price", 0.0)
     cost = finance.get("cost", 0.0)
+    curr = currency or "$"
     main_risk = report.get("main_risk", market.get("risks", ["Market competition"])[0] if market.get("risks") else "Competitive pressure")
 
-    if "lower" in q_lower or "discount" in q_lower or "20%" in q_lower or "drop" in q_lower:
+    if "lower" in q_lower or "discount" in q_lower or "20%" in q_lower or "drop" in q_lower or "cut" in q_lower:
         new_price = round(price * 0.8, 2)
         new_margin = round(((new_price - cost) / new_price) * 100, 2) if new_price > 0 else 0.0
         return (
-            f"If you reduce the target price by 20% to ₹{new_price:,.2f}:\n\n"
-            f"• **Unit Economics Impact**: Your gross margin drops from {margin}% to {new_margin}%. Profit per unit decreases from ₹{(price - cost):,.2f} to ₹{(new_price - cost):,.2f}.\n"
-            f"• **Competitive Position**: A ₹{new_price:,.2f} price point makes you significantly more competitive against entry-level incumbents.\n"
+            f"If you reduce the target price by 20% to {curr}{new_price:,.2f}:\n\n"
+            f"• **Unit Economics Impact**: Your gross margin drops from {margin}% to {new_margin}%. Profit per unit decreases from {curr}{(price - cost):,.2f} to {curr}{(new_price - cost):,.2f}.\n"
+            f"• **Competitive Position**: A {curr}{new_price:,.2f} price point makes you significantly more competitive against entry-level incumbents.\n"
             f"• **Strategic Recommendation**: Only pursue this price reduction if volume increases by at least {max(15, int(100 - new_margin))}% to offset the tighter gross margin buffer."
         )
     elif "risk" in q_lower or "mitigate" in q_lower or "protect" in q_lower:
-        competitor_names = ", ".join([c.split(" (")[0] for c in market.get("competitors", [])[:2]])
+        competitor_names = ", ".join([str(c).split(" (")[0] for c in market.get("competitors", [])[:2]])
         return (
             f"To mitigate your primary risk ({main_risk}):\n\n"
-            f"1. **Supplier Negotiation**: Lock in tiered unit volume discounts to safeguard your {margin}% margin against ad-spend fluctuations.\n"
+            f"1. **Supplier Negotiation**: Lock in tiered unit volume discounts to safeguard your {margin}% margin against operational fluctuations.\n"
             f"2. **Differentiated Value Proposition**: Instead of competing solely on price against {competitor_names or 'established brands'}, highlight clear differentiators (e.g. build quality, warranty, or software experience).\n"
-            f"3. **Controlled Pilot**: Run a measured pilot of 300–500 units to test product return rates and organic reviews before full-scale inventory commitment."
+            f"3. **Controlled Pilot**: Run a measured pilot batch to test customer return rates and organic reviews before full-scale inventory commitment."
         )
-    elif "double" in q_lower or "volume" in q_lower or "1,000" in q_lower or "1000" in q_lower or "scale" in q_lower:
+    elif "double" in q_lower or "volume" in q_lower or "scale" in q_lower or "1000" in q_lower:
         scaled_units = finance.get("expected_units", 500) * 2
         scaled_revenue = price * scaled_units
         scaled_profit = (price - cost) * scaled_units
         return (
-            f"Scaling volume to {scaled_units:,} units/month significantly enhances financial returns:\n\n"
-            f"• **Revenue Projection**: Monthly revenue reaches ₹{scaled_revenue:,.2f} with total gross profit of ₹{scaled_profit:,.2f}.\n"
+            f"Scaling volume to {scaled_units:,} units significantly enhances financial returns:\n\n"
+            f"• **Revenue Projection**: Revenue reaches {curr}{scaled_revenue:,.2f} with total gross profit of {curr}{scaled_profit:,.2f}.\n"
             f"• **Operational Leverage**: Doubling volume typically unlocks better procurement rates from suppliers, further expanding your {margin}% margin.\n"
-            f"• **Key Prerequisite**: Ensure your customer acquisition cost (CAC) remains tightly managed as you scale digital advertising campaigns."
+            f"• **Key Prerequisite**: Ensure your customer acquisition cost (CAC) remains tightly managed as you scale marketing campaigns."
         )
     else:
         return (
             f"Regarding your question '{query}':\n\n"
-            f"• **Current Assessment**: With a selling price of ₹{price:,.2f} and {margin}% margin, your unit economics are in a strong {report.get('recommendation', 'LAUNCH')} position.\n"
+            f"• **Current Assessment**: With a selling price of {curr}{price:,.2f} and {margin}% margin, your unit economics are in a strong {report.get('recommendation', 'LAUNCH')} position.\n"
             f"• **Market Context**: Watch out for {main_risk} and monitor key competitor moves closely.\n"
             f"• **Strategic Next Step**: Validate customer demand with pre-orders to verify conversion rates before expanding batch sizes."
         )
+

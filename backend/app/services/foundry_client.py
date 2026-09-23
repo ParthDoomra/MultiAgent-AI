@@ -18,12 +18,49 @@ _finance_agent_id: Optional[str] = None
 _market_agent_id: Optional[str] = None
 _report_agent_id: Optional[str] = None
 _sales_agent_id: Optional[str] = None
+_extractor_agent_id: Optional[str] = None
+_chat_agent_id: Optional[str] = None
 
 FINANCE_AGENT_NAME = "finance-agent"
 MARKET_AGENT_NAME = "market-agent"
 REPORT_AGENT_NAME = "report-agent"
 SALES_AGENT_NAME = "sales-agent"
+EXTRACTOR_AGENT_NAME = "extractor-agent"
+CHAT_AGENT_NAME = "chat-agent"
 DEFAULT_FOUNDRY_ENDPOINT = "https://arorapranav0129-3146-resource.services.ai.azure.com/api/projects/arorapranav0129-3146"
+
+EXTRACTOR_AGENT_INSTRUCTIONS = """You are an expert entity extraction agent for a business feasibility analysis system.
+Analyze the user's business query or conversation and extract the following parameters as a strict JSON object:
+
+- product (string): The exact product, service, or business idea being discussed (e.g., 'luxury perfume', 'organic matcha tea', 'SaaS project management tool', 'specialty coffee subscription', 'fitness tracker'). Do NOT default to any preset product.
+- target_market (string): The geographic region, country, city, or demographic target (e.g., 'Dubai', 'United States', 'India', 'UK', 'Germany', 'Global').
+- cost (number or null): The unit manufacturing, procurement, or direct variable cost per item or subscriber. Must be a numeric float without currency symbols (e.g. '$25/bottle' -> 25.0, 'manufacturing cost is ₹1,500' -> 1500.0, 'cost of 10' -> 10.0).
+- price (number or null): The target selling price, retail price, or subscription fee per item or subscriber. Must be a numeric float without currency symbols (e.g. '$120/bottle' -> 120.0, 'priced at ₹2,999' -> 2999.0, 'sell for $50' -> 50.0).
+- expected_units (integer or null): The projected sales volume, target customers, or units sold per month/batch (e.g. '300 bottles a month' -> 300, '500 units' -> 500, '1,000 subscribers' -> 1000).
+- currency (string): The currency symbol or code used in the query (e.g. '$', '₹', '€', '£', 'AED', 'USD', 'INR'). If unspecified, infer from country or default to '$'.
+- is_negotiation (boolean): Set to true if the query asks about wholesale deals, vendor discounts, commercial negotiations, retailer margins, or opening offers.
+
+You MUST respond ONLY with a strict JSON object (no markdown code blocks, no backticks, no conversational text) matching this schema:
+{
+  "product": "<string>",
+  "target_market": "<string>",
+  "cost": <number or null>,
+  "price": <number or null>,
+  "expected_units": <integer or null>,
+  "currency": "<string>",
+  "is_negotiation": <boolean>
+}
+"""
+
+CHAT_AGENT_INSTRUCTIONS = """You are a senior business launch advisor and strategic consultant.
+Given the full business feasibility context (financial unit economics, market competitor analysis, sales deal strategy, and overall launch verdict), provide a direct, insightful, and highly actionable response to the user's follow-up question.
+
+Guidelines:
+- Reference exact numbers, margins, and competitor dynamics from the context.
+- Provide concrete advice, strategic trade-offs, and practical execution steps.
+- Maintain a sharp, executive, clear, and professional tone.
+- Do not speak in vague generalities or filler phrases.
+"""
 
 FINANCE_AGENT_INSTRUCTIONS = """You are a financial calculation agent for business feasibility analysis.
 When given input parameters containing 'cost' (manufacturing/procurement cost per unit), 'price' (target selling price per unit), and 'expected_units' (projected sales volume in units), perform the following financial calculations:
@@ -141,6 +178,82 @@ def get_foundry_client() -> AgentsClient:
         credential = DefaultAzureCredential()
         _client_instance = AgentsClient(endpoint=endpoint, credential=credential)
     return _client_instance
+
+
+def get_or_create_extractor_agent(client: Optional[AgentsClient] = None) -> Any:
+    """
+    Retrieve or create the extractor-agent in Azure AI Foundry.
+    """
+    global _extractor_agent_id
+    if client is None:
+        client = get_foundry_client()
+
+    if _extractor_agent_id:
+        try:
+            return client.get_agent(agent_id=_extractor_agent_id)
+        except Exception as e:
+            logger.warning(f"Could not retrieve cached extractor agent {_extractor_agent_id}: {e}")
+            _extractor_agent_id = None
+
+    try:
+        existing_agents = client.list_agents()
+        for agent in existing_agents:
+            if getattr(agent, "name", None) == EXTRACTOR_AGENT_NAME:
+                _extractor_agent_id = agent.id
+                logger.info(f"Found existing Foundry extractor agent: {_extractor_agent_id}")
+                return agent
+    except Exception as e:
+        logger.warning(f"Could not list agents from Foundry: {e}")
+
+    model_name = os.getenv("FOUNDRY_MODEL", settings.FOUNDRY_MODEL or "gpt-4.1-mini")
+    logger.info(f"Creating new Foundry agent '{EXTRACTOR_AGENT_NAME}' with model '{model_name}'")
+    
+    agent = client.create_agent(
+        model=model_name,
+        name=EXTRACTOR_AGENT_NAME,
+        instructions=EXTRACTOR_AGENT_INSTRUCTIONS,
+        description="Extracts product, target market, unit cost, price, and expected volume from user business queries."
+    )
+    _extractor_agent_id = agent.id
+    return agent
+
+
+def get_or_create_chat_agent(client: Optional[AgentsClient] = None) -> Any:
+    """
+    Retrieve or create the chat-agent in Azure AI Foundry.
+    """
+    global _chat_agent_id
+    if client is None:
+        client = get_foundry_client()
+
+    if _chat_agent_id:
+        try:
+            return client.get_agent(agent_id=_chat_agent_id)
+        except Exception as e:
+            logger.warning(f"Could not retrieve cached chat agent {_chat_agent_id}: {e}")
+            _chat_agent_id = None
+
+    try:
+        existing_agents = client.list_agents()
+        for agent in existing_agents:
+            if getattr(agent, "name", None) == CHAT_AGENT_NAME:
+                _chat_agent_id = agent.id
+                logger.info(f"Found existing Foundry chat agent: {_chat_agent_id}")
+                return agent
+    except Exception as e:
+        logger.warning(f"Could not list agents from Foundry: {e}")
+
+    model_name = os.getenv("FOUNDRY_MODEL", settings.FOUNDRY_MODEL or "gpt-4.1-mini")
+    logger.info(f"Creating new Foundry agent '{CHAT_AGENT_NAME}' with model '{model_name}'")
+    
+    agent = client.create_agent(
+        model=model_name,
+        name=CHAT_AGENT_NAME,
+        instructions=CHAT_AGENT_INSTRUCTIONS,
+        description="Follow-up consultation agent providing deep business advice and answering user questions."
+    )
+    _chat_agent_id = agent.id
+    return agent
 
 
 def get_or_create_finance_agent(client: Optional[AgentsClient] = None) -> Any:
@@ -513,4 +626,110 @@ def run_report_agent_thread(
     # 4. Fetch the agent's assistant response
     raw_text = _get_agent_response_text(client, thread.id)
     return _clean_json_response(raw_text)
+
+
+def run_extractor_agent_thread(query: str) -> Dict[str, Any]:
+    """
+    Runs the Extractor Agent on Microsoft Foundry via a dedicated thread.
+    Extracts product, target_market, cost, price, expected_units, currency, and is_negotiation.
+    """
+    client = get_foundry_client()
+    agent = get_or_create_extractor_agent(client)
+
+    # 1. Create a thread
+    thread = client.threads.create()
+    logger.info(f"Created Foundry thread for extractor-agent: {thread.id}")
+
+    # 2. Add input query message
+    client.messages.create(
+        thread_id=thread.id,
+        role=MessageRole.USER,
+        content=f"Extract business parameters from this user query:\n\n{query}"
+    )
+
+    # 3. Create and process run
+    run = client.runs.create_and_process(
+        thread_id=thread.id,
+        agent_id=agent.id
+    )
+    logger.info(f"Foundry extractor run completed with status: {run.status}")
+
+    if run.status != "completed" and str(run.status) != "RunStatus.COMPLETED":
+        error_detail = getattr(run, "last_error", None) or f"Run status is {run.status}"
+        raise RuntimeError(f"Foundry Extractor Agent run did not complete successfully: {error_detail}")
+
+    # 4. Fetch response
+    raw_text = _get_agent_response_text(client, thread.id)
+    return _clean_json_response(raw_text)
+
+
+def run_followup_agent_thread(
+    query: str,
+    history: list,
+    finance_data: Dict[str, Any],
+    market_data: Dict[str, Any],
+    report_data: Dict[str, Any],
+    sales_data: Optional[Dict[str, Any]] = None
+) -> str:
+    """
+    Runs the Chat/Consultant Agent on Microsoft Foundry for follow-up conversational queries.
+    Provides direct strategic business consultation using the GPT model.
+    """
+    client = get_foundry_client()
+    agent = get_or_create_chat_agent(client)
+
+    # 1. Create a thread
+    thread = client.threads.create()
+    logger.info(f"Created Foundry thread for chat-agent: {thread.id}")
+
+    # Format context
+    history_lines = []
+    for turn in history:
+        if hasattr(turn, "role") and hasattr(turn, "content"):
+            history_lines.append(f"{turn.role}: {turn.content}")
+        elif isinstance(turn, dict):
+            history_lines.append(f"{turn.get('role')}: {turn.get('content')}")
+    history_str = "\n".join(history_lines)
+
+    context_prompt = (
+        f"Context from Business Feasibility Analysis:\n"
+        f"- Product: {market_data.get('product', 'Specified Business')}\n"
+        f"- Target Market: {market_data.get('target_market', 'Target Market')}\n"
+        f"- Financials: Price={finance_data.get('price')}, Cost={finance_data.get('cost')}, "
+        f"Revenue={finance_data.get('revenue')}, Profit={finance_data.get('gross_profit')}, Margin={finance_data.get('margin_percent')}%\n"
+        f"- Market Signals: Market Size={market_data.get('market_size')}, Competitors={market_data.get('competitors')}, "
+        f"Opportunities={market_data.get('opportunities')}, Risks={market_data.get('risks')}\n"
+    )
+    if sales_data:
+        context_prompt += (
+            f"- Sales Strategy: Min Price={sales_data.get('min_acceptable_price')}, "
+            f"Opening Offer={sales_data.get('recommended_opening_offer')}, Max Price={sales_data.get('max_asking_price')}, "
+            f"Strategy={sales_data.get('negotiation_strategy')}\n"
+        )
+    context_prompt += (
+        f"- Recommendation Verdict: {report_data.get('recommendation')} - {report_data.get('summary')}\n\n"
+        f"Previous Conversation:\n{history_str}\n\n"
+        f"User's Question: {query}\n\n"
+        f"Please provide a direct, insightful, and strategic answer with concrete numbers and actionable advice."
+    )
+
+    client.messages.create(
+        thread_id=thread.id,
+        role=MessageRole.USER,
+        content=context_prompt
+    )
+
+    run = client.runs.create_and_process(
+        thread_id=thread.id,
+        agent_id=agent.id
+    )
+    logger.info(f"Foundry chat run completed with status: {run.status}")
+
+    if run.status != "completed" and str(run.status) != "RunStatus.COMPLETED":
+        error_detail = getattr(run, "last_error", None) or f"Run status is {run.status}"
+        raise RuntimeError(f"Foundry Chat Agent run did not complete successfully: {error_detail}")
+
+    raw_text = _get_agent_response_text(client, thread.id)
+    return raw_text.strip()
+
 

@@ -8,6 +8,10 @@ from app.services.foundry_client import (
     run_report_agent_thread,
     get_or_create_sales_agent,
     run_sales_agent_thread,
+    get_or_create_extractor_agent,
+    run_extractor_agent_thread,
+    get_or_create_chat_agent,
+    run_followup_agent_thread,
     get_foundry_endpoint,
     FINANCE_AGENT_NAME,
     FINANCE_AGENT_INSTRUCTIONS,
@@ -17,6 +21,10 @@ from app.services.foundry_client import (
     REPORT_AGENT_INSTRUCTIONS,
     SALES_AGENT_NAME,
     SALES_AGENT_INSTRUCTIONS,
+    EXTRACTOR_AGENT_NAME,
+    EXTRACTOR_AGENT_INSTRUCTIONS,
+    CHAT_AGENT_NAME,
+    CHAT_AGENT_INSTRUCTIONS,
 )
 
 __all__ = [
@@ -29,6 +37,10 @@ __all__ = [
     "run_report_agent_thread",
     "get_or_create_sales_agent",
     "run_sales_agent_thread",
+    "get_or_create_extractor_agent",
+    "run_extractor_agent_thread",
+    "get_or_create_chat_agent",
+    "run_followup_agent_thread",
     "get_foundry_endpoint",
     "FINANCE_AGENT_NAME",
     "FINANCE_AGENT_INSTRUCTIONS",
@@ -38,4 +50,9 @@ __all__ = [
     "REPORT_AGENT_INSTRUCTIONS",
     "SALES_AGENT_NAME",
     "SALES_AGENT_INSTRUCTIONS",
+    "EXTRACTOR_AGENT_NAME",
+    "EXTRACTOR_AGENT_INSTRUCTIONS",
+    "CHAT_AGENT_NAME",
+    "CHAT_AGENT_INSTRUCTIONS",
 ]
+
